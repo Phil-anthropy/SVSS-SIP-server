@@ -1,0 +1,178 @@
+/*
+ * vuln_sip_cseq_defaults.c
+ *
+ * Minimal vulnerable SIP UDP server for CTF labs.
+ * On each request it copies the incoming message unsafely into a stack buffer (vulnerable),
+ * prints the buffer address to stdout, and replies with a SIP 200 OK where:
+ *   - If a header is present in the request, the same header is echoed back.
+ *   - If a header is missing, a sensible default value is used in the response.
+ *   - The CSeq header contains the leaked buffer address: "CSeq: buf address: 0x..."
+ *
+ * Build (lab only):
+ * gcc -fno-stack-protector -z execstack -no-pie -Wno-return-local-addr -o vuln_sip_cseq_defaults vuln_sip_cseq_defaults.c
+ *
+ * Run:
+ * ./vuln_sip_cseq_defaults
+ *
+ * WARNING: Intentionally vulnerable. Run only in an isolated lab.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+#define PORT 5060
+#define BUF_SIZE 360
+#define MAX_MSG 8192
+
+/* Vulnerable function: copies input into stack buffer without bounds checking */
+uintptr_t vulnerable(const char *input) {
+    char buf[BUF_SIZE];
+    /* intentional unsafe copy for CTF */
+    memcpy(buf, input, strlen(input));
+    /* print buffer address so operator can see it */
+    printf("buf address: %p\n", (void*)buf);
+    fflush(stdout);
+    return (uintptr_t)buf;
+}
+
+/* Extract header including its name, e.g. "Via: ..." into out (out must be large enough).
+ * If header not found, writes "<not-found>" into out.
+ */
+void get_header_line(const char *msg, const char *header_name, char *out, size_t outlen) {
+    const char *p = msg;
+    size_t name_len = strlen(header_name);
+    const char *found = NULL;
+
+    out[0] = '\0';
+
+    while ((found = strstr(p, header_name)) != NULL) {
+        /* ensure header_name occurs at line start or after CRLF */
+        if (found == msg || (found - 2 >= msg && found[-2] == '\r' && found[-1] == '\n')) {
+            const char *line_end = strstr(found, "\r\n");
+            size_t line_len = line_end ? (size_t)(line_end - found) : strlen(found);
+            if (line_len >= outlen) line_len = outlen - 1;
+            strncpy(out, found, line_len);
+            out[line_len] = '\0';
+            return;
+        }
+        p = found + name_len;
+    }
+
+    /* not found -> mark as not present */
+    snprintf(out, outlen, "<not-found>");
+}
+
+/* Helper: if header is missing (marked "<not-found>") return default string in dest */
+void ensure_header_default(char *dest, size_t destlen, const char *header_name, const char *default_value) {
+    if (dest == NULL) return;
+    if (strncmp(dest, "<not-found>", 11) == 0) {
+        /* produce "HeaderName: default_value" */
+        snprintf(dest, destlen, "%s %s", header_name, default_value);
+    }
+}
+
+int main(void) {
+    int sockfd;
+    struct sockaddr_in srv, cli;
+    socklen_t cli_len = sizeof(cli);
+    char msg[MAX_MSG];
+
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    memset(&srv, 0, sizeof(srv));
+    srv.sin_family = AF_INET;
+    srv.sin_addr.s_addr = INADDR_ANY;
+    srv.sin_port = htons(PORT);
+
+    if (bind(sockfd, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+        perror("bind");
+        close(sockfd);
+        return 1;
+    }
+
+    printf("Vulnerable SIP server (CSeq leak, defaults) listening on UDP/%d\n", PORT);
+
+    while (1) {
+        ssize_t n = recvfrom(sockfd, msg, sizeof(msg)-1, 0, (struct sockaddr *)&cli, &cli_len);
+        if (n < 0) {
+            perror("recvfrom");
+            continue;
+        }
+        msg[n] = '\0';
+
+        printf("Received %zd bytes from %s:%d\n", n, inet_ntoa(cli.sin_addr), ntohs(cli.sin_port));
+
+        /* call vulnerable routine which prints buffer address and returns it */
+        uintptr_t buf_addr = vulnerable(msg);
+
+        /* extract common SIP headers (Via, To, From, Call-ID). If missing, provide fallback */
+        char via[512], to[512], from_[512], callid[512], cseq_in[512];
+        get_header_line(msg, "Via:", via, sizeof(via));
+        get_header_line(msg, "To:", to, sizeof(to));
+        get_header_line(msg, "From:", from_, sizeof(from_));
+        get_header_line(msg, "Call-ID:", callid, sizeof(callid));
+        get_header_line(msg, "CSeq:", cseq_in, sizeof(cseq_in));
+
+        /* Provide sensible defaults when headers are missing */
+        /* Note: default strings are the header name followed by the default value */
+        ensure_header_default(via, sizeof(via), "Via:", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-default");
+        ensure_header_default(to, sizeof(to), "To:", "<sip:anonymous@127.0.0.1>");
+        ensure_header_default(from_, sizeof(from_), "From:", "<sip:anonymous@127.0.0.1>");
+        ensure_header_default(callid, sizeof(callid), "Call-ID:", "00000000@localhost");
+        /* we ignore client's CSeq; we'll put our own CSeq below that contains the leak */
+
+        /* a small SDP body used for INVITE responses (can be empty for OPTIONS) */
+        const char *sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=SVSS\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";
+        size_t sdp_len = strlen(sdp);
+
+        /* Build the 200 OK reply. Put the buffer address into the CSeq header. */
+        char response[MAX_MSG];
+        int r = snprintf(response, sizeof(response),
+            "SIP/2.0 200 OK\r\n"
+            "%s\r\n"
+            "%s\r\n"
+            "%s\r\n"
+            "%s\r\n"
+            /* CSeq header contains the buffer leak; keep also a numeric prefix for compatibility */
+            "CSeq: 1 OPTIONS (buf address: %p)\r\n"
+            "Contact: <sip:NoOne@SVSS.hack>\r\n"
+            "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REGISTER\r\n"
+            "Supported: replaces, timer\r\n"
+            "Content-Type: application/sdp\r\n"
+            "Server: Super Vulnerable Sip Server - SVSS\r\n"
+            "Content-Length: %zu\r\n"
+            "\r\n"
+            "%s",
+            via,
+            to,
+            from_,
+            callid,
+            (void*)buf_addr,
+            sdp_len,
+            sdp
+        );
+
+        if (r < 0 || (size_t)r >= sizeof(response)) {
+            fprintf(stderr, "response truncated/overflow\n");
+            continue;
+        }
+
+        /* send the reply */
+        ssize_t sent = sendto(sockfd, response, strlen(response), 0, (struct sockaddr *)&cli, cli_len);
+        if (sent < 0) {
+            perror("sendto");
+        } else {
+            printf("Sent %zd bytes reply (CSeq contains leak)\n", sent);
+        }
+    }
+
+    close(sockfd);
+    return 0;
+}
