@@ -1,6 +1,6 @@
 /*
  * vuln_sip_cseq_defaults.c
- *
+ * Super Vulnerable Sip Server - SVSS 
  * Minimal vulnerable SIP UDP server for CTF labs.
  * On each request it copies the incoming message unsafely into a stack buffer (vulnerable),
  * prints the buffer address to stdout, and replies with a SIP 200 OK where:
